@@ -1,0 +1,9 @@
+# plugins/Plugin_manager/config.toml
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[admin]
+# 在此处添加管理员QQ号，例如：
+# qq_list = [123456789, 987654321]
+qq_list = [2785185004]

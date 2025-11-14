@@ -1,0 +1,42 @@
+{
+  "manifest_version": 1,
+  "name": "插件管理器 (Plugin Manager)",
+  "version": "1.0.0",
+  "description": "管理所有插件的更新和状态，支持自动更新和版本检查",
+  "author": {
+    "name": "KArabella",
+    "url": "https://github.com/Kristen23557"
+  },
+  "license": "MIT License",
+  
+  "host_application": {
+    "min_version": "0.10.0"
+  },
+  "homepage_url": "https://github.com/Kristen23557/",
+  "repository_url": "https://github.com/Kristen23557/",
+  "keywords": ["plugin", "manager", "update", "admin", "management"],
+  "categories": ["System & Management"],
+  
+  "default_locale": "zh-CN",
+  "locales_path": "_locales",
+  
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "system",
+    "components": [
+      {
+        "type": "command",
+        "name": "PluginManagerCommand",
+        "description": "处理 /pm 命令，管理插件更新和状态",
+        "pattern": "/pm"
+      }
+    ],
+    "features": [
+      "插件列表查看",
+      "版本更新检查", 
+      "自动更新管理",
+      "管理员权限控制",
+      "批量更新支持"
+    ]
+  }
+}
