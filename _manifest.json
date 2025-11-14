@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "插件管理器 (Plugin Manager)",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "description": "管理所有插件的更新和状态，支持自动更新和版本检查",
   "author": {
     "name": "KArabella",
