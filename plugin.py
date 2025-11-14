@@ -5,6 +5,9 @@ import aiohttp
 import asyncio
 import shutil
 import tempfile
+import ssl
+import time
+import base64
 from typing import List, Tuple, Type, Optional, Dict, Any
 from pathlib import Path
 
@@ -15,9 +18,10 @@ from src.plugin_system import (
     ComponentInfo,
     ConfigField
 )
+from src.plugin_system.apis import chat_api, person_api
 
 # 插件管理器版本
-PLUGIN_MANAGER_VERSION = "1.0.0"
+PLUGIN_MANAGER_VERSION = "1.1.1"
 
 class PluginManagerCommand(BaseCommand):
     """插件管理器命令 - 管理所有插件的更新和状态"""
@@ -34,78 +38,202 @@ class PluginManagerCommand(BaseCommand):
         "🔸 `/pm update ALL` - 更新所有需要更新的插件\n"
         "🔸 `/pm info <插件名>` - 查看插件详细信息\n"
         "🔸 `/pm settings` - 管理插件自动更新设置\n"
+        "🔸 `/pm github` - 查看GitHub配置状态\n"
         "🔸 `/pm help` - 显示此帮助信息\n\n"
         "💡 **提示**\n"
         "• 默认忽略 'Hello World 示例插件'\n"
-        "• 只有管理员可以使用更新功能\n"
-        "• 插件更新从 GitHub 仓库获取最新版本"
+        "• 只有管理员可以使用插件管理器\n"
+        "• 如需更好的GitHub API体验，请在配置中添加GitHub Token"
     )
     intercept_message = True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last_api_call = 0
+        self._min_api_interval = 2.0  # 最少2秒间隔避免频率限制
+
     async def execute(self) -> Tuple[bool, Optional[str], bool]:
         """执行插件管理器命令"""
-        # 获取匹配的参数
-        matched_groups = self.matched_groups if self.matched_groups is not None else {}
-        action = matched_groups.get("action", "").strip().lower()
-        plugin_name = matched_groups.get("plugin_name", "").strip()
+        try:
+            # 首先检查管理员权限
+            if not await self._check_admin_permission():
+                try:
+                    await self.send_text("❌ 权限不足，只有管理员可以使用插件管理器。")
+                except Exception as e:
+                    print(f"发送权限错误消息失败: {e}")
+                return False, "权限不足", True
 
-        # 检查管理员权限（对于需要权限的操作）
-        if action in ["update", "settings"] and not await self._check_admin_permission():
-            try:
-                await self.send_text("❌ 权限不足，只有管理员可以使用此功能。")
-            except Exception as e:
-                print(f"发送权限错误消息失败: {e}")
-            return False, "权限不足", True
+            # 安全获取匹配的参数
+            matched_groups = self.matched_groups or {}
+            action = str(matched_groups.get("action", "")).strip().lower() if matched_groups.get("action") else ""
+            plugin_name = str(matched_groups.get("plugin_name", "")).strip() if matched_groups.get("plugin_name") else ""
 
-        # 处理不同动作
-        if action == "list":
-            return await self._list_plugins()
-        elif action == "check":
-            return await self._check_updates()
-        elif action == "update":
-            return await self._update_plugin(plugin_name)
-        elif action == "info":
-            return await self._plugin_info(plugin_name)
-        elif action == "settings":
-            return await self._manage_settings(plugin_name)
-        elif action == "help" or not action:
+            # 如果没有action，显示帮助
+            if not action:
+                try:
+                    await self.send_text(self.command_help)
+                except Exception as e:
+                    print(f"发送帮助信息失败: {e}")
+                return True, "已发送帮助信息", True
+
+            # 处理不同动作
+            if action == "list":
+                return await self._list_plugins()
+            elif action == "check":
+                return await self._check_updates()
+            elif action == "update":
+                return await self._update_plugin(plugin_name)
+            elif action == "info":
+                return await self._plugin_info(plugin_name)
+            elif action == "settings":
+                return await self._manage_settings(plugin_name)
+            elif action == "github":
+                return await self._show_github_status()
+            elif action == "help":
+                try:
+                    await self.send_text(self.command_help)
+                except Exception as e:
+                    print(f"发送帮助信息失败: {e}")
+                return True, "已发送帮助信息", True
+            else:
+                try:
+                    await self.send_text(f"❌ 未知命令: {action}\n请使用 `/pm help` 查看可用命令。")
+                except Exception as e:
+                    print(f"发送未知命令错误失败: {e}")
+                return False, f"未知命令: {action}", True
+
+        except Exception as e:
+            error_msg = f"❌ 命令执行出错: {str(e)}"
             try:
-                await self.send_text(self.command_help)
-            except Exception as e:
-                print(f"发送帮助信息失败: {e}")
-            return True, "已发送帮助信息", True
-        else:
-            try:
-                await self.send_text(f"❌ 未知命令: {action}\n请使用 `/pm help` 查看可用命令。")
-            except Exception as e:
-                print(f"发送未知命令错误失败: {e}")
-            return False, f"未知命令: {action}", True
+                await self.send_text(error_msg)
+            except Exception as send_e:
+                print(f"发送错误消息也失败了: {send_e}")
+            return False, error_msg, True
+
+    async def _show_github_status(self) -> Tuple[bool, Optional[str], bool]:
+        """显示GitHub配置状态"""
+        try:
+            github_config = self._get_github_config()
+            has_token = bool(github_config.get('token'))
+            has_username = bool(github_config.get('username'))
+            
+            status_message = "🔗 **GitHub配置状态**\n\n"
+            
+            if has_token and has_username:
+                status_message += "✅ **认证状态**: 已配置GitHub账号\n"
+                status_message += f"👤 **用户名**: {github_config['username']}\n"
+                status_message += "🔑 **Token状态**: 已配置\n"
+                status_message += "🚀 **API限制**: 大幅提升 (5000次/小时)\n"
+            elif has_token:
+                status_message += "⚠️ **认证状态**: 部分配置\n"
+                status_message += "🔑 **Token状态**: 已配置\n"
+                status_message += "👤 **用户名**: 未配置\n"
+                status_message += "🚀 **API限制**: 提升 (5000次/小时)\n"
+            else:
+                status_message += "❌ **认证状态**: 未配置GitHub账号\n"
+                status_message += "🔑 **Token状态**: 未配置\n"
+                status_message += "👤 **用户名**: 未配置\n"
+                status_message += "🐌 **API限制**: 严格 (60次/小时)\n"
+            
+            status_message += "\n💡 **配置说明**\n"
+            status_message += "• 在 `config.toml` 的 `[github]` 节中配置\n"
+            status_message += "• `username`: 你的GitHub用户名\n"
+            status_message += "• `token`: GitHub Personal Access Token\n"
+            status_message += "• 获取Token: https://github.com/settings/tokens\n"
+            status_message += "• Token权限: 只需要 `public_repo` 权限\n"
+            
+            await self.send_text(status_message)
+            return True, "已显示GitHub状态", True
+            
+        except Exception as e:
+            error_msg = f"❌ 获取GitHub状态时出错: {str(e)}"
+            await self.send_text(error_msg)
+            return False, error_msg, True
+
+    def _get_github_config(self) -> Dict[str, str]:
+        """获取GitHub配置"""
+        return {
+            'username': self.get_config("github.username", "").strip(),
+            'token': self.get_config("github.token", "").strip()
+        }
+
+    def _get_github_headers(self) -> Dict[str, str]:
+        """获取GitHub API请求头"""
+        github_config = self._get_github_config()
+        headers = {
+            'User-Agent': 'MaiBot-Plugin-Manager/1.1.1',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+        
+        # 如果有token，使用token认证
+        if github_config.get('token'):
+            headers['Authorization'] = f"token {github_config['token']}"
+            
+        return headers
 
     async def _check_admin_permission(self) -> bool:
-        """检查用户是否为管理员"""
+        """检查用户是否为管理员 - 使用聊天API正确获取用户信息"""
         try:
             # 获取配置的管理员QQ号列表
             admin_qq_list = self.get_config("admin.qq_list", [])
             if not admin_qq_list:
+                print("管理员QQ列表为空，拒绝访问")
                 return False
 
-            # 获取当前用户QQ号
-            chat_stream = getattr(self, 'chat_stream', None)
+            # 获取当前聊天流信息
+            message_obj = getattr(self, 'message', None)
+            if not message_obj:
+                print("无法获取message对象")
+                return False
+
+            # 获取聊天流
+            chat_stream = getattr(message_obj, 'chat_stream', None)
             if not chat_stream:
+                print("无法获取chat_stream")
                 return False
 
-            user_info = getattr(chat_stream, 'user_info', None)
-            if not user_info:
+            # 使用聊天API获取流信息
+            stream_info = chat_api.get_stream_info(chat_stream)
+            print(f"聊天流信息: {stream_info}")
+
+            # 根据聊天流类型获取用户ID
+            user_id = None
+            stream_type = chat_api.get_stream_type(chat_stream)
+            
+            if stream_type == "private":
+                # 私聊：直接从流信息获取用户ID
+                user_id = stream_info.get('user_id')
+                print(f"私聊用户ID: {user_id}")
+            elif stream_type == "group":
+                # 群聊：需要从消息发送者获取用户ID
+                sender_info = getattr(message_obj, 'sender_info', None)
+                if sender_info:
+                    user_id = getattr(sender_info, 'user_id', None)
+                    print(f"群聊发送者用户ID: {user_id}")
+            else:
+                print(f"未知聊天流类型: {stream_type}")
                 return False
 
-            user_qq = getattr(user_info, 'user_id', None)
-            if not user_qq:
+            if not user_id:
+                print("无法获取用户ID")
                 return False
 
-            return str(user_qq) in [str(qq) for qq in admin_qq_list]
+            # 转换为字符串比较
+            user_id_str = str(user_id).strip()
+            admin_qq_str_list = [str(qq).strip() for qq in admin_qq_list]
+            
+            print(f"权限检查 - 用户ID: '{user_id_str}', 管理员列表: {admin_qq_str_list}")
+            
+            # 精确匹配检查
+            is_admin = user_id_str in admin_qq_str_list
+            print(f"权限检查结果: {is_admin}")
+            
+            return is_admin
 
         except Exception as e:
             print(f"检查管理员权限时出错: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     async def _list_plugins(self) -> Tuple[bool, Optional[str], bool]:
@@ -138,7 +266,7 @@ class PluginManagerCommand(BaseCommand):
             return False, error_msg, True
 
     async def _check_updates(self) -> Tuple[bool, Optional[str], bool]:
-        """检查所有插件更新"""
+        """检查所有插件更新 - 统一发送结果"""
         try:
             plugins_dir = self._get_plugins_directory()
             plugins = self._scan_plugins(plugins_dir)
@@ -147,31 +275,69 @@ class PluginManagerCommand(BaseCommand):
                 await self.send_text("📦 未找到任何有效插件。")
                 return True, "未找到插件", True
 
-            # 检查每个插件的更新
-            update_available = []
-            checking_message = "🔄 **正在检查插件更新...**\n\n"
+            # 发送检查开始消息
+            checking_message = f"🔄 **正在检查 {len(plugins)} 个插件的更新...**\n请稍候..."
             await self.send_text(checking_message)
 
+            # 串行检查所有插件的更新（避免GitHub API限制）
+            update_available = []
+            check_results = []
+            
+            # 创建 SSL 上下文以禁用证书验证
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            github_config = self._get_github_config()
+            auth_status = "🔑 使用认证" if github_config.get('token') else "⚠️ 未认证"
+            
+            # 串行检查所有插件，避免GitHub API限制
             for plugin in plugins:
-                remote_version = await self._get_remote_version(plugin['repository_url'])
-                if remote_version and remote_version != plugin['local_version']:
-                    plugin['remote_version'] = remote_version
-                    plugin['needs_update'] = True
-                    update_available.append(plugin)
+                try:
+                    # 添加延迟避免API限制
+                    await self._rate_limit_delay()
                     
-                    progress_msg = f"🟡 {plugin['name']}: v{plugin['local_version']} → v{remote_version}"
-                    await self.send_text(progress_msg)
-                else:
-                    progress_msg = f"🟢 {plugin['name']}: v{plugin['local_version']} (最新)"
-                    await self.send_text(progress_msg)
+                    # 只使用 repository_url 字段
+                    repository_url = plugin.get('repository_url', '')
+                    if not repository_url:
+                        check_results.append(f"🔴 {plugin['name']}: v{plugin['local_version']} (无仓库地址)")
+                        continue
+                    
+                    remote_version = await self._get_remote_version(repository_url, ssl_context)
+                    if remote_version and remote_version != plugin['local_version']:
+                        plugin['remote_version'] = remote_version
+                        plugin['needs_update'] = True
+                        update_available.append(plugin)
+                        check_results.append(f"🟡 {plugin['name']}: v{plugin['local_version']} → v{remote_version}")
+                    else:
+                        check_results.append(f"🟢 {plugin['name']}: v{plugin['local_version']} (最新)")
+                except Exception as e:
+                    check_results.append(f"🔴 {plugin['name']}: v{plugin['local_version']} (检查失败)")
+                    print(f"检查插件 {plugin['name']} 更新失败: {e}")
 
-            # 发送检查结果摘要
+            # 构建统一的结果消息
+            result_message = "📊 **插件更新检查结果**\n\n"
+            
+            # 添加有更新的插件
             if update_available:
-                result_message = f"\n🎯 **检查完成**\n发现 {len(update_available)} 个可更新插件\n\n"
+                result_message += "🟡 **可更新插件**\n"
+                for plugin in update_available:
+                    result_message += f"• {plugin['name']}: v{plugin['local_version']} → v{plugin['remote_version']}\n"
+                result_message += "\n"
+            
+            # 添加所有插件状态
+            result_message += "📋 **所有插件状态**\n"
+            for result in check_results:
+                result_message += f"{result}\n"
+            
+            # 添加操作提示
+            result_message += f"\n🎯 **检查完成**\n"
+            if update_available:
+                result_message += f"发现 {len(update_available)} 个可更新插件\n\n"
                 result_message += f"💡 使用 `/pm update ALL` 更新所有插件\n"
                 result_message += f"🔧 或使用 `/pm update <插件名>` 更新指定插件"
             else:
-                result_message = "\n🎯 **检查完成**\n🟢 所有插件均为最新版本"
+                result_message += "🟢 所有插件均为最新版本"
 
             await self.send_text(result_message)
             return True, f"检查完成，发现 {len(update_available)} 个可更新插件", True
@@ -180,6 +346,14 @@ class PluginManagerCommand(BaseCommand):
             error_msg = f"❌ 检查更新时出错: {str(e)}"
             await self.send_text(error_msg)
             return False, error_msg, True
+
+    async def _rate_limit_delay(self):
+        """API调用频率限制"""
+        current_time = time.time()
+        time_since_last_call = current_time - self._last_api_call
+        if time_since_last_call < self._min_api_interval:
+            await asyncio.sleep(self._min_api_interval - time_since_last_call)
+        self._last_api_call = time.time()
 
     async def _update_plugin(self, plugin_name: str) -> Tuple[bool, Optional[str], bool]:
         """更新指定插件或所有插件"""
@@ -192,10 +366,25 @@ class PluginManagerCommand(BaseCommand):
             plugins = self._scan_plugins(plugins_dir)
             
             if plugin_name.upper() == "ALL":
-                # 更新所有需要更新的插件
+                # 先检查所有需要更新的插件
                 plugins_to_update = []
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                checking_message = "🔄 **正在检查所有插件的更新状态...**"
+                await self.send_text(checking_message)
+                
                 for plugin in plugins:
-                    remote_version = await self._get_remote_version(plugin['repository_url'])
+                    # 添加延迟避免API限制
+                    await self._rate_limit_delay()
+                    
+                    # 只使用 repository_url 字段
+                    repository_url = plugin.get('repository_url', '')
+                    if not repository_url:
+                        continue
+                    
+                    remote_version = await self._get_remote_version(repository_url, ssl_context)
                     if remote_version and remote_version != plugin['local_version']:
                         plugin['remote_version'] = remote_version
                         plugin['needs_update'] = True
@@ -209,21 +398,23 @@ class PluginManagerCommand(BaseCommand):
                 await self.send_text(update_message)
 
                 success_count = 0
+                update_results = []
                 for plugin in plugins_to_update:
                     try:
                         if await self._perform_plugin_update(plugin):
                             success_count += 1
-                            progress_msg = f"✅ 已更新: {plugin['name']} → v{plugin['remote_version']}"
-                            await self.send_text(progress_msg)
+                            update_results.append(f"✅ {plugin['name']} → v{plugin['remote_version']}")
                         else:
-                            error_msg = f"❌ 更新失败: {plugin['name']}"
-                            await self.send_text(error_msg)
+                            update_results.append(f"❌ {plugin['name']} 更新失败")
                     except Exception as e:
-                        error_msg = f"❌ 更新 {plugin['name']} 时出错: {str(e)}"
-                        await self.send_text(error_msg)
+                        update_results.append(f"❌ {plugin['name']} 更新出错: {str(e)}")
 
-                final_msg = f"🎉 **更新完成**\n成功更新 {success_count}/{len(plugins_to_update)} 个插件"
-                await self.send_text(final_msg)
+                # 统一发送更新结果
+                result_message = f"🎉 **批量更新完成**\n成功: {success_count}/{len(plugins_to_update)}\n\n"
+                for result in update_results:
+                    result_message += f"{result}\n"
+                
+                await self.send_text(result_message)
                 return True, f"批量更新完成: {success_count}/{len(plugins_to_update)}", True
 
             else:
@@ -239,7 +430,20 @@ class PluginManagerCommand(BaseCommand):
                     return False, f"插件未找到: {plugin_name}", True
 
                 # 检查是否需要更新
-                remote_version = await self._get_remote_version(target_plugin['repository_url'])
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                # 添加延迟避免API限制
+                await self._rate_limit_delay()
+                
+                # 只使用 repository_url 字段
+                repository_url = target_plugin.get('repository_url', '')
+                if not repository_url:
+                    await self.send_text(f"❌ 插件 {plugin_name} 没有配置仓库地址")
+                    return False, "无仓库地址", True
+                
+                remote_version = await self._get_remote_version(repository_url, ssl_context)
                 if not remote_version:
                     await self.send_text(f"❌ 无法获取 {plugin_name} 的远程版本信息")
                     return False, "无法获取远程版本", True
@@ -292,13 +496,25 @@ class PluginManagerCommand(BaseCommand):
             info_message += f"🔸 **仓库**: {target_plugin['repository_url']}\n"
             
             # 检查远程版本
-            remote_version = await self._get_remote_version(target_plugin['repository_url'])
-            if remote_version:
-                status = "🟢 最新" if remote_version == target_plugin['local_version'] else "🟡 可更新"
-                info_message += f"🔸 **远程版本**: v{remote_version}\n"
-                info_message += f"🔸 **状态**: {status}\n"
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # 添加延迟避免API限制
+            await self._rate_limit_delay()
+            
+            # 只使用 repository_url 字段
+            repository_url = target_plugin.get('repository_url', '')
+            if repository_url:
+                remote_version = await self._get_remote_version(repository_url, ssl_context)
+                if remote_version:
+                    status = "🟢 最新" if remote_version == target_plugin['local_version'] else "🟡 可更新"
+                    info_message += f"🔸 **远程版本**: v{remote_version}\n"
+                    info_message += f"🔸 **状态**: {status}\n"
+                else:
+                    info_message += "🔸 **状态**: 🔴 无法检查更新\n"
             else:
-                info_message += "🔸 **状态**: 🔴 无法检查更新\n"
+                info_message += "🔸 **状态**: 🔴 无仓库地址\n"
 
             # 自动更新设置
             auto_update = self._get_plugin_auto_update_setting(target_plugin['name'])
@@ -413,65 +629,132 @@ class PluginManagerCommand(BaseCommand):
         
         return plugins
 
-    async def _get_remote_version(self, repository_url: str) -> Optional[str]:
-        """从GitHub仓库获取最新版本号"""
+    async def _get_remote_version(self, repository_url: str, ssl_context: ssl.SSLContext = None) -> Optional[str]:
+        """从GitHub仓库获取最新版本号 - 支持GitHub认证"""
         try:
             if not repository_url or "github.com" not in repository_url:
+                print(f"无效的仓库URL: {repository_url}")
+                return None
+
+            # 清理和验证仓库URL
+            repo_path = repository_url.replace("https://github.com/", "").strip("/")
+            if not repo_path or '/' not in repo_path:
+                print(f"无效的仓库路径: {repo_path}")
                 return None
 
             # 构建GitHub API URL
-            repo_path = repository_url.replace("https://github.com/", "").strip("/")
             api_url = f"https://api.github.com/repos/{repo_path}/contents/_manifest.json"
+            print(f"请求GitHub API: {api_url}")
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(api_url) as response:
+            # 创建连接器，禁用SSL验证
+            connector = aiohttp.TCPConnector(ssl=ssl_context) if ssl_context else None
+            
+            # 获取GitHub认证头
+            headers = self._get_github_headers()
+            github_config = self._get_github_config()
+            
+            timeout = aiohttp.ClientTimeout(total=15)  # 15秒超时
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get(api_url, headers=headers) as response:
+                    print(f"GitHub API响应状态: {response.status}")
+                    
                     if response.status == 200:
                         data = await response.json()
                         if 'content' in data:
                             # 解码base64内容
-                            import base64
                             content = base64.b64decode(data['content']).decode('utf-8')
                             manifest_data = json.loads(content)
-                            return manifest_data.get('version', None)
+                            version = manifest_data.get('version')
+                            print(f"获取到远程版本: {version}")
+                            return version
+                        else:
+                            print(f"响应中缺少content字段: {data}")
+                    elif response.status == 403:
+                        # 检查速率限制头
+                        remaining = response.headers.get('X-RateLimit-Remaining', '未知')
+                        limit = response.headers.get('X-RateLimit-Limit', '未知')
+                        reset_time = response.headers.get('X-RateLimit-Reset', '未知')
+                        print(f"GitHub API限制 - 剩余: {remaining}/{limit}, 重置: {reset_time}")
+                        
+                        if github_config.get('token'):
+                            print("即使使用Token也遇到限制，可能需要等待")
+                        else:
+                            print("未使用GitHub Token，API限制严格")
+                            
+                    elif response.status == 404:
+                        print("仓库或manifest文件不存在")
+                    elif response.status == 401:
+                        print("GitHub Token无效或过期")
+                    else:
+                        print(f"GitHub API错误: {response.status}")
+                        error_text = await response.text()
+                        print(f"错误详情: {error_text}")
             
+            return None
+        except asyncio.TimeoutError:
+            print(f"获取远程版本超时: {repository_url}")
             return None
         except Exception as e:
             print(f"获取远程版本失败 {repository_url}: {e}")
             return None
 
     async def _perform_plugin_update(self, plugin: Dict[str, Any]) -> bool:
-        """执行插件更新：从GitHub仓库下载并覆盖文件"""
+        """执行插件更新：从GitHub仓库下载并覆盖文件 - 支持GitHub认证"""
         try:
             repository_url = plugin['repository_url']
             if not repository_url or "github.com" not in repository_url:
+                print(f"无效的仓库URL: {repository_url}")
                 return False
 
             repo_path = repository_url.replace("https://github.com/", "").strip("/")
+            if not repo_path or '/' not in repo_path:
+                print(f"无效的仓库路径: {repo_path}")
+                return False
+
             api_url = f"https://api.github.com/repos/{repo_path}/contents/"
+            print(f"开始更新插件 {plugin['name']}，仓库: {repo_path}")
+
+            # 创建 SSL 上下文以禁用证书验证
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+
+            # 获取GitHub认证头
+            headers = self._get_github_headers()
 
             # 创建临时目录
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_path = Path(temp_dir)
                 
                 # 获取仓库文件列表
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
                     async with session.get(api_url) as response:
                         if response.status != 200:
+                            print(f"获取仓库文件列表失败: {response.status}")
                             return False
                         
                         files_data = await response.json()
+                        print(f"找到 {len(files_data)} 个文件")
                         
                         # 下载所有文件
+                        download_tasks = []
                         for file_info in files_data:
-                            if file_info['type'] == 'file':
-                                file_url = file_info['download_url']
-                                file_path = temp_path / file_info['name']
-                                
-                                async with session.get(file_url) as file_response:
-                                    if file_response.status == 200:
-                                        content = await file_response.read()
-                                        with open(file_path, 'wb') as f:
-                                            f.write(content)
+                            if file_info['type'] == 'file' and file_info.get('download_url'):
+                                download_tasks.append(self._download_file(session, file_info, temp_path))
+                        
+                        # 并行下载文件
+                        if download_tasks:
+                            await asyncio.gather(*download_tasks, return_exceptions=True)
+
+                # 检查是否下载了文件
+                downloaded_files = list(temp_path.iterdir())
+                if not downloaded_files:
+                    print("没有成功下载任何文件")
+                    return False
+
+                print(f"成功下载 {len(downloaded_files)} 个文件")
 
                 # 备份原插件目录
                 plugin_dir = plugin['directory_path']
@@ -479,6 +762,7 @@ class PluginManagerCommand(BaseCommand):
                 if backup_dir.exists():
                     shutil.rmtree(backup_dir)
                 shutil.copytree(plugin_dir, backup_dir)
+                print(f"已创建备份: {backup_dir}")
 
                 try:
                     # 清空原目录
@@ -494,6 +778,8 @@ class PluginManagerCommand(BaseCommand):
                             shutil.copy2(item, plugin_dir / item.name)
                         elif item.is_dir():
                             shutil.copytree(item, plugin_dir / item.name)
+
+                    print(f"成功更新插件 {plugin['name']}")
 
                     # 更新成功后删除备份
                     if backup_dir.exists():
@@ -517,11 +803,31 @@ class PluginManagerCommand(BaseCommand):
                                 shutil.copy2(item, plugin_dir / item.name)
                             elif item.is_dir():
                                 shutil.copytree(item, plugin_dir / item.name)
+                        print("已从备份恢复插件")
                     return False
 
         except Exception as e:
             print(f"执行插件更新失败 {plugin['name']}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+
+    async def _download_file(self, session: aiohttp.ClientSession, file_info: Dict, temp_path: Path) -> None:
+        """下载单个文件"""
+        try:
+            file_url = file_info['download_url']
+            file_path = temp_path / file_info['name']
+            
+            async with session.get(file_url) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    with open(file_path, 'wb') as f:
+                        f.write(content)
+                    print(f"下载成功: {file_info['name']}")
+                else:
+                    print(f"下载失败 {file_info['name']}: {response.status}")
+        except Exception as e:
+            print(f"下载文件 {file_info['name']} 时出错: {e}")
 
     def _get_settings_file_path(self) -> Path:
         """获取设置文件路径"""
@@ -561,7 +867,7 @@ class PluginManagerPlugin(BasePlugin):
     plugin_name = "plugin_manager"
     plugin_description = "插件管理器，用于管理插件的更新和状态检查"
     plugin_version = PLUGIN_MANAGER_VERSION
-    plugin_author = "Plugin Manager Team"
+    plugin_author = "KArabella"
     enable_plugin = True
 
     dependencies = []
@@ -570,7 +876,8 @@ class PluginManagerPlugin(BasePlugin):
     config_file_name = "config.toml"
     config_section_descriptions = {
         "plugin": "插件启用配置",
-        "admin": "管理员配置"
+        "admin": "管理员配置",
+        "github": "GitHub API配置"
     }
 
     config_schema = {
@@ -582,7 +889,7 @@ class PluginManagerPlugin(BasePlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.0.0",
+                default="1.1.1",
                 description="配置文件版本"
             ),
         },
@@ -590,7 +897,19 @@ class PluginManagerPlugin(BasePlugin):
             "qq_list": ConfigField(
                 type=list,
                 default=[],
-                description="管理员QQ号列表"
+                description="管理员QQ号列表（所有命令都需要管理员权限）"
+            )
+        },
+        "github": {
+            "username": ConfigField(
+                type=str,
+                default="",
+                description="GitHub用户名（用于显示和调试）"
+            ),
+            "token": ConfigField(
+                type=str,
+                default="",
+                description="GitHub Personal Access Token（获取地址：https://github.com/settings/tokens，只需要public_repo权限）"
             )
         }
     }
