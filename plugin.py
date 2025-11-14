@@ -43,7 +43,8 @@ class PluginManagerCommand(BaseCommand):
         "💡 **提示**\n"
         "• 默认忽略 'Hello World 示例插件'\n"
         "• 只有管理员可以使用插件管理器\n"
-        "• 如需更好的GitHub API体验，请在配置中添加GitHub Token"
+        "• 如需更好的GitHub API体验，请在配置中添加GitHub Token\n"
+        "• 尽管此插件带有自动更新功能，但我们仍然强烈建议您在更新或检查插件更新后手动检查插件文件!!!"
     )
     intercept_message = True
 
