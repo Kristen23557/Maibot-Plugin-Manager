@@ -894,7 +894,7 @@ class PluginManagerPlugin(BasePlugin):
     plugin_name = "plugin_manager"
     plugin_description = "插件管理器，用于管理插件的更新和状态检查"
     plugin_version = PLUGIN_MANAGER_VERSION
-    plugin_author = "Plugin Manager Team"
+    plugin_author = "KArabella"
     enable_plugin = True
 
     dependencies = []
