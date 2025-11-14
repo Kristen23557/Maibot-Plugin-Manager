@@ -1,6 +1,6 @@
 # plugin_manager - 配置文件
 # 管理所有插件的更新和状态，支持自动更新和版本检查
-# 配置版本: 1.1.1
+# 配置版本: 1.1.2
 
 # 插件启用配置
 [plugin]
@@ -9,7 +9,7 @@
 enabled = true
 
 # 配置文件版本
-config_version = "1.1.1"
+config_version = "1.1.2"
 
 
 # 管理员配置
