@@ -21,7 +21,7 @@ from src.plugin_system import (
 from src.plugin_system.apis import chat_api, person_api
 
 # 插件管理器版本
-PLUGIN_MANAGER_VERSION = "1.1.1"
+PLUGIN_MANAGER_VERSION = "1.1.2"
 
 class PluginManagerCommand(BaseCommand):
     """插件管理器命令 - 管理所有插件的更新和状态"""
@@ -161,7 +161,7 @@ class PluginManagerCommand(BaseCommand):
         """获取GitHub API请求头"""
         github_config = self._get_github_config()
         headers = {
-            'User-Agent': 'MaiBot-Plugin-Manager/1.1.1',
+            'User-Agent': 'MaiBot-Plugin-Manager/1.1.2',
             'Accept': 'application/vnd.github.v3+json'
         }
         
@@ -700,7 +700,7 @@ class PluginManagerCommand(BaseCommand):
             return None
 
     async def _perform_plugin_update(self, plugin: Dict[str, Any]) -> bool:
-        """执行插件更新：从GitHub仓库下载并覆盖文件 - 支持GitHub认证"""
+        """执行插件更新：从GitHub仓库下载并覆盖文件 - 改进的网络稳定性"""
         try:
             repository_url = plugin['repository_url']
             if not repository_url or "github.com" not in repository_url:
@@ -738,20 +738,33 @@ class PluginManagerCommand(BaseCommand):
                         files_data = await response.json()
                         print(f"找到 {len(files_data)} 个文件")
                         
-                        # 下载所有文件
+                        # 只下载必要的文件，跳过LICENSE等非必要文件
+                        essential_files = ['plugin.py', '_manifest.json', 'config.toml', 'requirements.txt']
                         download_tasks = []
                         for file_info in files_data:
                             if file_info['type'] == 'file' and file_info.get('download_url'):
-                                download_tasks.append(self._download_file(session, file_info, temp_path))
+                                file_name = file_info['name']
+                                # 优先下载必要文件，其他文件可选
+                                if file_name in essential_files or file_name.endswith('.py') or file_name.endswith('.json'):
+                                    download_tasks.append(self._download_file_with_retry(session, file_info, temp_path))
                         
-                        # 并行下载文件
+                        # 并行下载文件，但限制并发数
                         if download_tasks:
-                            await asyncio.gather(*download_tasks, return_exceptions=True)
+                            # 限制并发数为3，避免网络压力过大
+                            semaphore = asyncio.Semaphore(3)
+                            async def limited_download(task):
+                                async with semaphore:
+                                    return await task
+                            
+                            limited_tasks = [limited_download(task) for task in download_tasks]
+                            await asyncio.gather(*limited_tasks, return_exceptions=True)
 
-                # 检查是否下载了文件
+                # 检查是否下载了必要文件
                 downloaded_files = list(temp_path.iterdir())
-                if not downloaded_files:
-                    print("没有成功下载任何文件")
+                essential_downloaded = any(file.name in essential_files for file in downloaded_files)
+                
+                if not essential_downloaded:
+                    print("没有成功下载必要文件")
                     return False
 
                 print(f"成功下载 {len(downloaded_files)} 个文件")
@@ -812,22 +825,35 @@ class PluginManagerCommand(BaseCommand):
             traceback.print_exc()
             return False
 
-    async def _download_file(self, session: aiohttp.ClientSession, file_info: Dict, temp_path: Path) -> None:
-        """下载单个文件"""
-        try:
-            file_url = file_info['download_url']
-            file_path = temp_path / file_info['name']
+    async def _download_file_with_retry(self, session: aiohttp.ClientSession, file_info: Dict, temp_path: Path, max_retries: int = 3) -> None:
+        """下载单个文件，带重试机制"""
+        for attempt in range(max_retries):
+            try:
+                file_url = file_info['download_url']
+                file_path = temp_path / file_info['name']
+                
+                # 设置较短的超时时间，避免长时间等待
+                timeout = aiohttp.ClientTimeout(total=10)
+                
+                async with session.get(file_url, timeout=timeout) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        with open(file_path, 'wb') as f:
+                            f.write(content)
+                        print(f"下载成功: {file_info['name']} (尝试 {attempt + 1})")
+                        return
+                    else:
+                        print(f"下载失败 {file_info['name']}: {response.status} (尝试 {attempt + 1})")
+            except asyncio.TimeoutError:
+                print(f"下载超时 {file_info['name']} (尝试 {attempt + 1})")
+            except Exception as e:
+                print(f"下载文件 {file_info['name']} 时出错 (尝试 {attempt + 1}): {e}")
             
-            async with session.get(file_url) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    with open(file_path, 'wb') as f:
-                        f.write(content)
-                    print(f"下载成功: {file_info['name']}")
-                else:
-                    print(f"下载失败 {file_info['name']}: {response.status}")
-        except Exception as e:
-            print(f"下载文件 {file_info['name']} 时出错: {e}")
+            # 如果不是最后一次尝试，等待后重试
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)  # 等待1秒后重试
+        
+        print(f"下载失败 {file_info['name']}，已重试 {max_retries} 次")
 
     def _get_settings_file_path(self) -> Path:
         """获取设置文件路径"""
@@ -867,7 +893,7 @@ class PluginManagerPlugin(BasePlugin):
     plugin_name = "plugin_manager"
     plugin_description = "插件管理器，用于管理插件的更新和状态检查"
     plugin_version = PLUGIN_MANAGER_VERSION
-    plugin_author = "KArabella"
+    plugin_author = "Plugin Manager Team"
     enable_plugin = True
 
     dependencies = []
@@ -889,7 +915,7 @@ class PluginManagerPlugin(BasePlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.1.1",
+                default="1.1.2",
                 description="配置文件版本"
             ),
         },
